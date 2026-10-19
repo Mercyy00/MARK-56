@@ -52,5 +52,7 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+outputs/
+uploads/
 *.zip
 ~$*

@@ -254,10 +254,16 @@ def _play_youtube(player, source: str, token: int) -> None:
     page = source if _YT.search(source) else _search_page(source)
     opened = ""
     try:
-        webbrowser.open(page)
+        from actions.browser_control import open_url
+        open_url(page)
         opened = " and it has been opened in the browser instead"
     except Exception:
-        pass
+        import webbrowser
+        try:
+            webbrowser.open(page)
+            opened = " and it has been opened in the browser instead"
+        except Exception:
+            pass
     _say(player, "Tell the user, in one short sentence in their own language: "
                  f"'{source}' could not be played on the display "
                  f"({err}){opened}.")

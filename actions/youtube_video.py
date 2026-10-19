@@ -64,14 +64,19 @@ def _get_api_key() -> str:
 
 def _open_url(url: str) -> None:
     try:
-        if is_mac():
-            subprocess.Popen(["open", url])
-        elif is_linux():
-            subprocess.Popen(["xdg-open", url])
-        else:
-            subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
+        from actions.browser_control import open_url
+        open_url(url)
     except Exception as e:
-        print(f"[YouTube] ⚠️ open_url failed: {e}")
+        print(f"[YouTube] ⚠️ browser_control.open_url failed ({e}), using OS fallback…")
+        try:
+            if is_mac():
+                subprocess.Popen(["open", url])
+            elif is_linux():
+                subprocess.Popen(["xdg-open", url])
+            else:
+                subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
+        except Exception as fallback_err:
+            print(f"[YouTube] ⚠️ Fallback open_url failed: {fallback_err}")
 
 def _scrape_first_video_url(query: str) -> str | None:
 

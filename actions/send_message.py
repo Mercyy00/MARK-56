@@ -120,14 +120,20 @@ def _open_app(app_name: str) -> bool:
 
 
 def _open_browser_url(url: str) -> bool:
-    import webbrowser
     try:
-        webbrowser.open(url)
-        time.sleep(4.0) 
+        from actions.browser_control import open_url
+        open_url(url)
+        time.sleep(4.0)
         return True
     except Exception as e:
-        print(f"[SendMessage] ⚠️ Could not open browser: {e}")
-        return False
+        print(f"[SendMessage] ⚠️ open_url failed ({e}), using webbrowser fallback…")
+        import webbrowser
+        try:
+            webbrowser.open(url)
+            time.sleep(4.0)
+            return True
+        except Exception:
+            return False
 
 def _search_in_app(query: str) -> None:
     _require_pyautogui()
@@ -178,54 +184,34 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
     )
 
 def _send_whatsapp(receiver: str, message: str) -> str:
-    """WhatsApp goes through the verified driver when there is one.
-
-    _desktop_send below is a sequence of keystrokes with sleeps between them:
-    it presses Win, types the app name, presses Ctrl+F, types the contact,
-    presses Enter twice and reports success — without ever reading back which
-    window received any of that. When the machine is a second slower than the
-    sleeps assume, the whole sequence lands somewhere else and the user is
-    still told the message was sent.
-
-    plugins/_whatsapp_core.py already drives WhatsApp properly for the calling
-    plugins: it finds the real window, opens the conversation, checks the
-    conversation is the right person's, types, and confirms the box emptied
-    before it says "sent". Using it here costs nothing and removes the one
-    failure that matters — a message reported as delivered that never left.
-
-    The blind path stays as the fallback for a machine where the driver cannot
-    run at all (the plugin file removed, a missing dependency, no WhatsApp).
-    But once the driver HAS run, its answer stands: falling back after it
-    refused to send is how a message ends up typed into the wrong
-    conversation, which is worse than not sending it.
+    """Sends WhatsApp message via the native desktop WhatsApp app on the device.
+    Falls back to persistent browser automation only if the desktop application is unavailable.
     """
-    try:
-        from plugins import _whatsapp_core as wa
-    except Exception as e:
-        print(f"[SendMessage] WhatsApp driver unavailable ({e}) — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
+    desktop_res = _desktop_send("WhatsApp", receiver, message)
+    if not desktop_res.startswith("status=failed"):
+        return desktop_res
 
     try:
-        transport, why = wa.get()
+        from actions.browser_control import _registry
+        sess = _registry.get()
+        return sess.run(sess.send_whatsapp_message(receiver, message))
     except Exception as e:
-        print(f"[SendMessage] WhatsApp driver failed to start ({e}) — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
-
-    if transport is None:
-        print(f"[SendMessage] {why} — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
-
-    sent, failure = transport.send_message_to(receiver, message)
-    if sent:
-        # The one platform that can say `done`: the driver opened the
-        # conversation, proved it was the right person's, typed, and confirmed
-        # the box emptied.
-        return outcome.done("send_message", platform="WhatsApp",
-                            to=receiver, verified=True)
-    return outcome.failed("send_message", failure,
-                          platform="WhatsApp", to=receiver)
+        print(f"[SendMessage] Browser WhatsApp fallback notice: {e}")
+        return desktop_res
 
 def _send_telegram(receiver: str, message: str) -> str:
+    """Sends Telegram message via persistent browser session (verified), with desktop app fallback.
+    The browser session uses ~/.jarvis_profiles/common_session so the login persists across all runs.
+    """
+    try:
+        from actions.browser_control import _registry
+        sess = _registry.get()
+        res = sess.run(sess.send_telegram_message(receiver, message))
+        if outcome.is_done(res) or "login" in res.lower() or "qr code" in res.lower() or "could not find" in res.lower():
+            return res
+    except Exception as e:
+        print(f"[SendMessage] Browser Telegram automation error ({e}) — falling back to desktop…")
+
     return _desktop_send("Telegram", receiver, message)
 
 def _send_signal(receiver: str, message: str) -> str:

@@ -178,15 +178,16 @@ class WhisperSTT:
     _LANG_MIN_CONFIDENCE = 0.65
     _LANG_MIN_CHARS = 12
 
-    def _accept_language(self, code: str, confidence: float, text: str) -> None:
-        """Update the language the voice follows — only on real evidence.
+    _ALLOWED_LANGUAGES = {"en", "mr", "hi"}
 
-        The FIRST detection is always taken, whatever it scores: at the start of
-        a session there is nothing to keep, and refusing to choose would leave
-        the assistant with no language at all.
+    def _accept_language(self, code: str, confidence: float, text: str) -> None:
+        """Update the language the voice follows — only on real evidence and restricted
+        strictly to supported languages: English (en), Marathi (mr), and Hindi (hi).
         """
         code = code.strip().lower()
-        if not code:
+        if not code or code not in self._ALLOWED_LANGUAGES:
+            if not self.detected_language:
+                self.detected_language = "en"
             return
         if not self.detected_language:
             self.detected_language = code

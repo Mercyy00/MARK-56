@@ -714,6 +714,24 @@ def file_controller(
         elif action == "info":
             return get_file_info(path, name=name)
 
+        elif action in ("open_file", "open", "launch", "view"):
+            target = _resolve_path(f"{path}/{name}" if name else path)
+            if target.suffix.lower() == ".pdf":
+                from core.pdf_handler import open_pdf
+                ok, msg = open_pdf(target)
+                return msg
+            if not target.exists():
+                return f"File does not exist: {target}"
+            import platform as _plt
+            _os_name = _plt.system()
+            if _os_name == "Windows":
+                os.startfile(str(target))
+            elif _os_name == "Darwin":
+                subprocess.Popen(["open", str(target)], shell=False)
+            else:
+                subprocess.Popen(["xdg-open", str(target)], shell=False)
+            return f"Opened '{target.name}' in system default application."
+
         else:
             return f"Unknown action: '{action}'"
 
@@ -730,7 +748,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
+                "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info | open_file"
             },
             "path": {
                 "type": "STRING",

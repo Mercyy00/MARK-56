@@ -377,6 +377,33 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
     matches = appidentity.running(app_name)
 
     if not matches:
+        # Check if the requested target is a web application / browser tab (e.g. YouTube, Netflix, Gmail)
+        web_keywords = {
+            "youtube", "youtube.com", "yt", "netflix", "gmail", "google",
+            "reddit", "twitter", "x", "facebook", "instagram", "twitch",
+            "github", "linkedin", "whatsapp", "chatgpt", "tab", "browser tab"
+        }
+        lower_app = app_name.lower().strip()
+        is_web = (
+            lower_app in web_keywords
+            or "tab" in lower_app
+            or any(lower_app.endswith(tld) for tld in (".com", ".org", ".net", ".io", ".tv", ".ai", ".app"))
+        )
+        if is_web:
+            try:
+                from actions.browser_control import _close_native_tab
+                res = _close_native_tab(title=app_name)
+                if "Closed" in res:
+                    return outcome.done(
+                        "close_app",
+                        app=app_name,
+                        closed=f"web tab '{app_name}'",
+                        tab=True,
+                        verified=True,
+                    )
+            except Exception as e:
+                print(f"[ComputerControl] Fallback web tab close error: {e}")
+
         # Nothing, or nothing that is not us. Telling those two apart matters:
         # "it is not running" and "the only thing by that name is me" need
         # completely different sentences.

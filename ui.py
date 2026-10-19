@@ -12,6 +12,9 @@ import time
 from pathlib import Path
 
 import psutil
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 if platform.system() == "Windows":
     _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -423,6 +426,14 @@ class HudCanvas(QWidget):
             except Exception:
                 self._avatar = None
 
+        self._neural_core = None
+        try:
+            from core.neural_core import HolographicNeuralCore
+            self._neural_core = HolographicNeuralCore()
+        except Exception as _nc_err:
+            print(f"[HUD] HolographicNeuralCore load notice: {_nc_err}")
+            self._neural_core = None
+
         # Which centrepiece to draw. Read once here and changed live by the
         # settings toggle; the avatar object is kept either way so switching
         # back is instant and costs no reload.
@@ -430,7 +441,7 @@ class HudCanvas(QWidget):
             from memory.config_manager import get_hud_style
             self.hud_style = get_hud_style()
         except Exception:
-            self.hud_style = "face"
+            self.hud_style = "neural"
         self._core_phase = 0.0
 
         self._tick       = 0
@@ -858,39 +869,39 @@ class HudCanvas(QWidget):
             self._grid_key   = _gkey
         p.drawPixmap(0, 0, self._grid_cache)
 
-        # ── holographic head ────────────────────────────────────────────────
-        # Sized to the band between the top of the canvas and the status line,
-        # capped by width, so it fills the HUD at any window size — including
-        # fullscreen — without ever colliding with the status text below.
+        # ── centrepiece: 3D Holographic Neural Core, Animated Face, or Reactor Core ──
         _sy_status = cy + fw * 0.40
-        if self._avatar is not None and self.hud_style == "face":
-            _band_t = 12.0
-            _band_h = max(60.0, _sy_status - 12.0 - _band_t)
+        _band_t = 12.0
+        _band_h = max(60.0, _sy_status - 12.0 - _band_t)
+        _r = min(W * 0.46, _band_h / 2.0)
+
+        if self.muted:
+            _main = _acc = qcol(C.MUTED_C)
+        else:
+            _main = qcol(C.PRI)
+            if self.speaking:
+                _acc = qcol(C.ACC)
+            elif self.state in ("THINKING", "PROCESSING"):
+                _acc = qcol(C.ACC2)
+            elif self.state == "LISTENING":
+                _acc = qcol(C.GREEN)
+            else:
+                _acc = qcol(C.PRI)
+
+        if self._neural_core is not None and self.hud_style == "neural":
+            try:
+                self._neural_core.paint(
+                    p, cx, _band_t + _band_h / 2.0, _r, _main, _acc, qcol(C.BG),
+                    state=self.state, speaking=self.speaking, amp=self._amp_disp,
+                    tick=self._tick, name=self._assistant_name
+                )
+            except Exception:
+                self._paint_core(p, cx, _band_t + _band_h / 2.0, _r, W, _band_h)
+        elif self._avatar is not None and self.hud_style == "face":
             _r_head = min(fw * 0.355, _band_h / (self._avatar.SPAN + 0.08))
             _head_cy = _band_t + (_band_h - self._avatar.SPAN * _r_head) / 2.0 + _r_head
-
-            if self.muted:
-                _main = _acc = qcol(C.MUTED_C)
-            else:
-                _main = qcol(C.PRI)
-                if self.speaking:
-                    _acc = qcol(C.ACC)
-                elif self.state in ("THINKING", "PROCESSING"):
-                    _acc = qcol(C.ACC2)
-                elif self.state == "LISTENING":
-                    _acc = qcol(C.GREEN)
-                else:
-                    _acc = qcol(C.PRI)
             self._avatar.paint(p, cx, _head_cy, _r_head, _main, _acc, qcol(C.BG))
-
-        # reactor core — the other centrepiece, and the fallback if the head
-        # could not be built. There is no third path: the old face.png branch
-        # was unreachable (no such file ships) and the bare orb it fell through
-        # to is what this replaces.
         else:
-            _band_t = 12.0
-            _band_h = max(60.0, _sy_status - 12.0 - _band_t)
-            _r = min(W * 0.46, _band_h / 2.0)
             self._paint_core(p, cx, _band_t + _band_h / 2.0, _r, W, _band_h)
 
         # status text
@@ -6449,29 +6460,36 @@ class MainWindow(QMainWindow):
 
     def _refresh_hud_btn(self):
         from memory.config_manager import get_hud_style
-        face = get_hud_style() == "face"
-        # Neither state is "off", so both read as active — this is a choice
-        # between two things, not a switch with a disabled side.
+        st = get_hud_style()
         style = f"""
             QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
                 border: 1px solid {C.BORDER_A}; border-radius: 3px;
                 text-align: left; padding: 0 8px; }}
             QPushButton:hover {{ color: {C.WHITE}; border: 1px solid {C.BORDER_B}; }}"""
-        self._hud_btn.setText("🧑  HUD: ANIMATED FACE" if face
-                              else "◉  HUD: REACTOR CORE")
+        if st == "neural":
+            self._hud_btn.setText("🌌  HUD: HOLOGRAPHIC NEURAL CORE")
+            self._hud_btn.setToolTip(
+                "3D Holographic Neural Core with locked physics (25% density, 0.35x flux, 1.90x curl, 1.55x gimbal, 0.50x photon). "
+                "Tap to switch to animated face."
+            )
+        elif st == "face":
+            self._hud_btn.setText("🧑  HUD: ANIMATED FACE")
+            self._hud_btn.setToolTip(
+                "An animated head that speaks your words and shows what JARVIS is doing. Tap to switch to the reactor core."
+            )
+        else:
+            self._hud_btn.setText("◉  HUD: REACTOR CORE")
+            self._hud_btn.setToolTip(
+                "A reactor core that turns with the state and moves with your voice. Tap to switch to the Holographic Neural Core."
+            )
         self._hud_btn.setStyleSheet(style)
-        self._hud_btn.setToolTip(
-            "An animated head that speaks your words and shows what JARVIS is "
-            "doing. Tap to switch to the reactor core."
-            if face else
-            "A reactor core that turns with the state and moves with your voice. "
-            "Tap to switch to the animated head.")
 
     def _toggle_hud_style(self):
-        """Swap the centrepiece. Both objects stay in memory, so the change is
-        instant and switching back costs nothing."""
+        """Swap the centrepiece: neural -> face -> core -> neural."""
         from memory.config_manager import get_hud_style, save_hud_style
-        want = "core" if get_hud_style() == "face" else "face"
+        cur = get_hud_style()
+        cycle = {"neural": "face", "face": "core", "core": "neural"}
+        want = cycle.get(cur, "neural")
         save_hud_style(want)
         try:
             self.hud.hud_style = want
@@ -6479,9 +6497,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._refresh_hud_btn()
-        self._log.append_log(
-            "SYS: HUD switched to the animated face." if want == "face"
-            else "SYS: HUD switched to the reactor core.")
+        labels = {
+            "neural": "3D Holographic Neural Core",
+            "face": "animated face",
+            "core": "reactor core",
+        }
+        self._log.append_log(f"SYS: HUD switched to {labels.get(want, want)}.")
 
     def _toggle_ptt(self):
         from memory.config_manager import (get_push_to_talk_enabled,
@@ -7097,6 +7118,11 @@ class JarvisUI:
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
+        if hasattr(self, "on_state_changed") and callable(self.on_state_changed):
+            try:
+                self.on_state_changed(state)
+            except Exception:
+                pass
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)

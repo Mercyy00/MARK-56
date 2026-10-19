@@ -235,12 +235,17 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
         except Exception:
             return f"PDF size: {_file_size_str(path)}"
 
+    if action in ("open", "view", "launch", "show"):
+        from core.pdf_handler import open_pdf
+        ok, msg = open_pdf(path)
+        return msg
+
     if action in ("to_word", "to_docx", "convert_to_docx"):
         from core import document_engine
         out = _output_path(path, "converted", ".docx")
         return document_engine.convert_pdf_to_docx(path, out)
 
-    return f"Unknown PDF action: '{action}'. Try: summarize, extract_text, info, to_word"
+    return f"Unknown PDF action: '{action}'. Try: open, summarize, extract_text, info, to_word"
 
 def _process_text_doc(path: Path, file_type: str, action: str,
                        params: dict, speak=None) -> str:
@@ -867,7 +872,7 @@ TOOL = {
             },
             "action": {
                 "type": "STRING",
-                "description": "What to do with the file. Examples by type:\nimage: describe | ocr | resize | compress | convert | info\npdf: summarize | extract_text | to_word | info\ndocx/txt: summarize | fix | reformat | translate_hint | word_count | to_bullet\ncsv/excel: analyze | stats | filter | sort | convert | info\njson: validate | format | analyze | to_csv\ncode: explain | review | fix | optimize | run | document | test\naudio: transcribe | trim | convert | info\nvideo: trim | extract_audio | extract_frame | compress | transcribe | info | convert\narchive: list | extract\npptx: summarize | extract_text | analyze"
+                "description": "What to do with the file. Examples by type:\nimage: describe | ocr | resize | compress | convert | info\npdf: open | summarize | extract_text | to_word | info\ndocx/txt: summarize | fix | reformat | translate_hint | word_count | to_bullet\ncsv/excel: analyze | stats | filter | sort | convert | info\njson: validate | format | analyze | to_csv\ncode: explain | review | fix | optimize | run | document | test\naudio: transcribe | trim | convert | info\nvideo: trim | extract_audio | extract_frame | compress | transcribe | info | convert\narchive: list | extract\npptx: summarize | extract_text | analyze"
             },
             "instruction": {
                 "type": "STRING",

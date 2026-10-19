@@ -105,7 +105,7 @@ def save_voice(voice_name: str) -> None:
 
 
 def get_wake_word_enabled() -> bool:
-    """Whether local wake-word gating is on (assistant sleeps until 'Hey Jarvis')."""
+    """Whether local wake-word gating is on (assistant sleeps until wake word heard)."""
     return load_api_keys().get("wake_word_enabled", False)
 
 
@@ -121,6 +121,37 @@ def save_wake_word_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+DEFAULT_WAKE_WORDS = ["Hey Jarvis", "Jarvis", "Computer", "Friday", "Mark 56"]
+
+
+def get_wake_words() -> list[str]:
+    """Return list of configured wake words/phrases.
+
+    Allows natural waking with convenient phrases like 'Jarvis', 'Computer',
+    'Friday', or 'Mark 56' rather than strictly 'Hey Jarvis'.
+    """
+    raw = load_api_keys().get("wake_words")
+    if isinstance(raw, list):
+        cleaned = [str(w).strip() for w in raw if str(w).strip()]
+        if cleaned:
+            return cleaned
+    elif isinstance(raw, str) and raw.strip():
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if parts:
+            return parts
+    # Check legacy singular wake_word if set
+    single = load_api_keys().get("wake_word")
+    if single and isinstance(single, str) and single.strip():
+        return [single.strip()]
+    return list(DEFAULT_WAKE_WORDS)
+
+
+def save_wake_words(words: list[str]) -> None:
+    """Save configured wake words list to config."""
+    cleaned = [str(w).strip() for w in words if str(w).strip()]
+    _save_flag("wake_words", cleaned if cleaned else list(DEFAULT_WAKE_WORDS))
+
+
 def get_push_to_talk_enabled() -> bool:
     """Hold-a-key-to-speak. When on, the mic is closed unless the chord is held."""
     return load_api_keys().get("push_to_talk_enabled", False)
@@ -130,24 +161,22 @@ def save_push_to_talk_enabled(enabled: bool) -> None:
     _save_flag("push_to_talk_enabled", enabled)
 
 
-HUD_STYLES = ("face", "core")
+HUD_STYLES = ("neural", "face", "core")
 
 
 def get_hud_style() -> str:
-    """Which centrepiece the HUD draws: the animated head, or the reactor core.
+    """Which centrepiece the HUD draws: the 3D Holographic Neural Core, the animated head, or the reactor core.
 
-    Taste, not capability — both render in the same software painter and cost
-    about the same. Defaults to the head because that is what MARK LIV shipped
-    with; anyone who preferred the older look can switch back in ⚙ and the
-    choice survives a restart.
+    Taste, not capability — renders with locked neural physics (25% density, 0.35x flux, 1.90x curl, 1.55x gimbal, 0.50x photon).
+    Defaults to the 3D Holographic Neural Core ("neural"). Anyone who preferred the face or reactor core can switch in ⚙.
     """
-    v = str(load_api_keys().get("hud_style", "face")).strip().lower()
-    return v if v in HUD_STYLES else "face"
+    v = str(load_api_keys().get("hud_style", "neural")).strip().lower()
+    return v if v in HUD_STYLES else "neural"
 
 
 def save_hud_style(style: str) -> None:
     s = str(style or "").strip().lower()
-    _save_flag("hud_style", s if s in HUD_STYLES else "face")
+    _save_flag("hud_style", s if s in HUD_STYLES else "neural")
 
 
 # ── Live-session tuning ──────────────────────────────────────────────────────
@@ -550,3 +579,48 @@ def save_providers(mode: str = None, pipeline: dict = None, creds: dict = None,
 
     data["providers"] = block
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+# ── Default browser ──────────────────────────────────────────────────────────
+SUPPORTED_BROWSERS = (
+    "chrome",
+    "brave",
+    "edge",
+    "firefox",
+    "opera",
+    "operagx",
+    "vivaldi",
+    "safari",
+    "system",
+)
+DEFAULT_BROWSER = "chrome"
+
+
+def get_default_browser() -> str:
+    """Return the configured default browser for JARVIS web navigation.
+
+    Defaults to 'chrome'. Set to 'system' to delegate to host OS associations.
+    """
+    raw = str(load_api_keys().get("default_browser", DEFAULT_BROWSER) or DEFAULT_BROWSER).strip().lower()
+    return raw if raw in SUPPORTED_BROWSERS else DEFAULT_BROWSER
+
+
+def save_default_browser(browser_name: str) -> None:
+    """Persist the configured default browser for JARVIS."""
+    b = str(browser_name or "").strip().lower()
+    _save_flag("default_browser", b if b in SUPPORTED_BROWSERS else DEFAULT_BROWSER)
+
+
+def get_browser_executable_path(browser_name: str | None = None) -> str | None:
+    """Return custom executable override path for a specific browser, if configured."""
+    key = f"browser_path_{browser_name.lower().strip()}" if browser_name else "browser_path"
+    val = load_api_keys().get(key)
+    return str(val).strip() if val and str(val).strip() else None
+
+
+def save_browser_executable_path(browser_name: str, path: str) -> None:
+    """Persist custom executable override path for a specific browser."""
+    b = str(browser_name or "").strip().lower()
+    key = f"browser_path_{b}" if b else "browser_path"
+    _save_flag(key, str(path or "").strip())
+

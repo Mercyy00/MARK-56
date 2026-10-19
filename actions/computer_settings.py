@@ -299,7 +299,39 @@ def close_app():
         "name in 'app_name'",
     )
 
+def _focus_browser_or_active_window(target: str = "") -> bool:
+    """Ensure a browser or target window is focused before sending tab/window shortcuts."""
+    candidates = [target] if target else []
+    for b in ["Brave", "Chrome", "Edge", "Firefox", "Opera", "Vivaldi"]:
+        if b not in candidates:
+            candidates.append(b)
+    if _OS == "Windows":
+        for cand in candidates:
+            if not cand:
+                continue
+            try:
+                cmd = [
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    f'(New-Object -ComObject WScript.Shell).AppActivate("{cand}")'
+                ]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=2, **_WIN_HIDE)
+                if res.stdout and "True" in res.stdout:
+                    time.sleep(0.2)
+                    return True
+            except Exception:
+                continue
+    elif _OS == "Darwin":
+        for cand in candidates:
+            if cand:
+                script = f'tell application "System Events" to set frontmost of (first process whose name contains "{cand}") to true'
+                r = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=2)
+                if r.returncode == 0:
+                    time.sleep(0.2)
+                    return True
+    return False
+
 def close_window():
+    _focus_browser_or_active_window()
     if _OS == "Darwin": pyautogui.hotkey("command", "w")
     else:               pyautogui.hotkey("ctrl", "w")
 
@@ -391,6 +423,7 @@ def refresh_page():
     else:               pyautogui.press("f5")
 
 def close_tab():
+    _focus_browser_or_active_window()
     if _OS == "Darwin": pyautogui.hotkey("command", "w")
     else:               pyautogui.hotkey("ctrl", "w")
 

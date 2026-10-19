@@ -48,6 +48,7 @@ It's not just an assistant — it's an extension of your digital life.
 ### Core Features
 | Feature | Description |
 |---|---|
+| 🌌 3D Holographic Neural Core | Full-stack WebGL/Three.js + PyQt6 3D neural core with locked physics (25% density, 0.35x flux, 1.90x curl turbulence, 1.55x gimbal velocity, 0.50x photon size), reactive audio waveforms, and 5 Stark color themes |
 | 🧑‍🎤 Holographic Avatar | An animated human head in the HUD — real facial geometry, lit and drawn in software, no GPU or extra packages |
 | 👄 Real Lip-Sync | ~50 mouth shapes a second from the audio's formants **and** the transcript — closures, spreads and rounds, not a volume meter |
 | 🌍 Language-Free Mouth | Articulation is derived by Unicode reduction, so Latin, Cyrillic and Greek scripts all work from one rule set — and scripts that hide pronunciation fall back cleanly |
@@ -635,10 +636,18 @@ It is held in memory only, deliberately: writing it to disk would make a fresh l
 ## ⚡ Quick Start
 
 ```bash
-git clone https://github.com/FatihMakes/Mark-LVI.git
 cd Mark-LVI
-python setup.py        # installs deps for YOUR OS + the browser automation engine
+
+# 🌌 Launch 3D Holographic Neural Core Desktop UI (Default):
 python main.py
+# or
+python run_holo.py
+
+# 🧑 Launch legacy PyQt6 window:
+python main.py --ui=qt
+
+# 🌐 Open in browser or remote phone dashboard:
+http://localhost:8000/
 ```
 
 `setup.py` only ever installs what your operating system needs — the Windows-only libraries are skipped automatically on macOS and Linux, and vice-versa. It also checks your Python version up front, so a wrong interpreter fails with a sentence instead of a wall of pip output. Prefer to do it by hand? `pip install -r requirements.txt` works too.

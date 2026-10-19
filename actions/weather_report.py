@@ -22,9 +22,8 @@ def weather_action(
     url           = f"https://www.google.com/search?q={quote_plus(search_query)}"
 
     try:
-        opened = webbrowser.open(url)
-        if not opened:
-            raise RuntimeError("webbrowser.open returned False")
+        from actions.browser_control import open_url
+        open_url(url)
     except Exception as e:
         msg = f"Sir, I couldn't open the browser for the weather report: {e}"
         _log(msg, player)

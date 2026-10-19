@@ -102,6 +102,23 @@ def _launch_windows(app_name: str) -> bool:
          without a command line for anything to be appended to.
       3. the Start Menu, typed like a person would.
     """
+    norm = app_name.strip().lower()
+    if norm in ("whatsapp", "whatsapp desktop", "whatsappdesktop"):
+        try:
+            subprocess.Popen(
+                ["explorer.exe", "shell:AppsFolder\\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception as exc:
+            print(f"[open_app] WhatsApp UWP launch failed: {exc}")
+        try:
+            os.startfile("whatsapp:")
+            return True
+        except Exception:
+            pass
+
     resolved = shutil.which(app_name)
     if resolved:
         try:
@@ -292,6 +309,22 @@ def open_app(parameters=None, response=None, player=None,
     spoken = ((parameters or {}).get("app_name") or "").strip()
     if not spoken:
         return outcome.failed("open_app", "no application name was given")
+
+    # Check if this is a web URL or web application domain
+    low_spoken = spoken.lower().strip()
+    is_web_dest = (
+        low_spoken.startswith(("http://", "https://"))
+        or "://" in low_spoken
+        or any(low_spoken.endswith(tld) for tld in (".com", ".org", ".net", ".io", ".tv", ".ai", ".app", ".edu", ".gov"))
+    )
+    if is_web_dest:
+        try:
+            from actions.browser_control import open_url
+            _log(player, f"JARVIS: Opening web destination {spoken}…")
+            open_url(spoken)
+            return outcome.done("open_app", app=spoken, url=spoken, verified=True)
+        except Exception as exc:
+            print(f"[open_app] Failed routing web destination ({spoken}): {exc}")
 
     if _SYSTEM not in _LAUNCHERS:
         return outcome.failed(

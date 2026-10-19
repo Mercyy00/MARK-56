@@ -7,12 +7,15 @@ import importlib.util
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+import psutil
 from core import appidentity, outcome
 
 # Importing playwright cost 198 ms at every launch, paid by action discovery
@@ -82,6 +85,11 @@ def _load_playwright() -> None:
 
 
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
+
+if _OS == "Windows":
+    _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
+else:
+    _WIN_HIDE: dict = {}
 
 def _normalize_url(url: str) -> str:
     """
@@ -173,6 +181,28 @@ def _real_profile_dir(browser: str) -> str:
     fallback.mkdir(parents=True, exist_ok=True)
     print(f"[Browser] ⚠️  Real profile not found for {browser}, using: {fallback}")
     return str(fallback)
+
+def get_jarvis_common_profile_dir() -> Path:
+    """Returns the dedicated, persistent profile directory for JARVIS.
+    All browser automation sessions (WhatsApp Web, Telegram Web, general browsing)
+    share this persistent profile so cookies, logins, IndexedDB, and localStorage
+    are NEVER reset across runs.
+    """
+    target = Path.home() / ".jarvis_profiles" / "common_session"
+    target.mkdir(parents=True, exist_ok=True)
+    old_chrome = Path.home() / ".jarvis_profiles" / "chrome"
+    if old_chrome.exists() and not (target / "Default").exists():
+        try:
+            import shutil
+            if (old_chrome / "Default").exists():
+                shutil.copytree(str(old_chrome / "Default"), str(target / "Default"), dirs_exist_ok=True)
+            for f in old_chrome.glob("*"):
+                if f.is_file() and not (target / f.name).exists():
+                    shutil.copy2(str(f), str(target / f.name))
+            print(f"[Browser] Migrated existing profile from {old_chrome} to {target}")
+        except Exception as e:
+            print(f"[Browser] Note on profile migration: {e}")
+    return target
 
 def _firefox_profile_dir() -> Optional[str]:
     home = Path.home()
@@ -407,6 +437,162 @@ def _detect_default_browser() -> str:
     return "chrome"
 
 
+def _resolve_browser_executable(browser_name: str) -> Optional[str]:
+    """
+    Resolves the absolute path to a browser's executable binary across Windows, macOS, and Linux.
+    Probing order:
+      1. Custom path override from memory.config_manager.
+      2. Windows Registry (App Paths and StartMenuInternet).
+      3. Standard well-known installation directories.
+      4. System PATH via shutil.which().
+    """
+    if not browser_name:
+        return None
+    name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+
+    # 1. Check custom path configured in config_manager
+    try:
+        from memory import config_manager
+        custom_path = config_manager.get_browser_executable_path(name)
+        if custom_path and Path(custom_path).exists():
+            return str(Path(custom_path).resolve())
+    except Exception:
+        pass
+
+    # 2. Platform-specific resolution
+    if _OS == "Windows":
+        if name in ("opera", "operagx"):
+            exe = _find_opera_windows()
+            if exe and Path(exe).exists():
+                return exe
+
+        # Check Windows Registry App Paths and StartMenuInternet
+        exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
+        if exe and Path(exe).exists():
+            return exe
+
+        # Standard installation directories on Windows
+        prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+
+        candidate_paths: list[Path] = []
+        if name == "chrome":
+            candidate_paths = [
+                Path(prog_files) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                Path(prog_files_x86) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                Path(local_appdata) / "Google" / "Chrome" / "Application" / "chrome.exe",
+            ]
+        elif name == "brave":
+            candidate_paths = [
+                Path(prog_files) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+                Path(prog_files_x86) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+                Path(local_appdata) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+            ]
+        elif name == "edge":
+            candidate_paths = [
+                Path(prog_files_x86) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+                Path(prog_files) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+            ]
+        elif name == "firefox":
+            candidate_paths = [
+                Path(prog_files) / "Mozilla Firefox" / "firefox.exe",
+                Path(prog_files_x86) / "Mozilla Firefox" / "firefox.exe",
+            ]
+        elif name == "vivaldi":
+            candidate_paths = [
+                Path(local_appdata) / "Vivaldi" / "Application" / "vivaldi.exe",
+                Path(prog_files) / "Vivaldi" / "Application" / "vivaldi.exe",
+            ]
+
+        for p in candidate_paths:
+            try:
+                if p and p.exists() and p.is_file():
+                    return str(p)
+            except Exception:
+                continue
+
+        # Check PATH with .exe
+        found = shutil.which(f"{name}.exe") or shutil.which(name)
+        if found and Path(found).exists():
+            return found
+
+    elif _OS == "Darwin":
+        app = _MAC_APP_NAMES.get(name)
+        if app:
+            app_dir = Path("/Applications") / f"{app}.app" / "Contents" / "MacOS"
+            if app_dir.exists():
+                bins = list(app_dir.iterdir())
+                if bins:
+                    return str(bins[0])
+        found = shutil.which(name)
+        if found:
+            return found
+
+    elif _OS == "Linux":
+        spec = _BROWSER_SPECS.get("Linux", {}).get(name, {})
+        for b in spec.get("bins", []):
+            found = shutil.which(b)
+            if found:
+                return found
+        found = shutil.which(name)
+        if found:
+            return found
+
+    return None
+
+
+def is_browser_available(browser_name: str) -> bool:
+    """Check if the specified browser is installed and resolvable on the current system."""
+    if not browser_name:
+        return False
+    name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+    if _OS == "Darwin":
+        app = _MAC_APP_NAMES.get(name)
+        if app and (Path("/Applications") / f"{app}.app").exists():
+            return True
+    return _resolve_browser_executable(name) is not None
+
+
+def get_jarvis_browser(preferred: Optional[str] = None) -> str:
+    """
+    Determines the effective browser to use under the JARVIS Default Browser Policy.
+
+    Priority Order:
+      1. Explicit runtime argument `preferred` (e.g. 'edge', 'firefox').
+      2. Configured JARVIS default browser from memory.config_manager.get_default_browser() (defaults to 'chrome').
+         - If configured as 'system', delegates to host OS detected browser.
+         - If configured browser is installed/available, returns it.
+      3. Fallback to Host OS detected default browser via _detect_default_browser().
+      4. Safe ultimate fallback: 'chrome'.
+    """
+    if preferred and preferred.strip():
+        norm = _ALIASES.get(preferred.lower().strip(), preferred.lower().strip())
+        if norm != "system":
+            return norm
+
+    try:
+        from memory import config_manager
+        configured = config_manager.get_default_browser()
+    except Exception:
+        configured = "chrome"
+
+    if configured and configured != "system":
+        configured = _ALIASES.get(configured.lower().strip(), configured.lower().strip())
+        if is_browser_available(configured):
+            return configured
+
+    # Host OS default fallback
+    try:
+        host_default = _detect_default_browser()
+        if host_default and is_browser_available(host_default):
+            return host_default
+    except Exception:
+        pass
+
+    return "chrome"
+
+
 _SEARCH_ENGINES: dict[str, str] = {
     "google":     "https://www.google.com/search?q=",
     "bing":       "https://www.bing.com/search?q=",
@@ -429,62 +615,64 @@ _MAC_APP_NAMES: dict[str, str] = {
 _WIN_EXE_HINTS: dict[str, str] = {"chrome": "chrome", "edge": "msedge"}
 
 
-def _open_native(url: str, browser_name: Optional[str]) -> str:
+def _open_native(url: str, browser_name: Optional[str] = None) -> str:
     """
     Opens the user's REAL browser normally — with their own profile,
-    logged-in accounts and extensions. No automation attaches, so an
-    about:blank tab or a blank profile NEVER shows up.
-    If url is empty the browser starts with no URL (its own start page /
-    session restore) — exactly as if the user had opened it themselves.
-    Works on all three of Windows / macOS / Linux.
+    logged-in accounts and extensions. Enforces the JARVIS Default Browser Policy
+    (prioritizing Google Chrome / configured browser) over the host OS default.
     """
     url = _normalize_url(url) if url and url.strip() else ""
     if url == "about:blank":
         url = ""
 
-    name = None
-    if browser_name:
-        name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
-    elif not url:
-        # No URL → only a window will open; needs the default browser's exe
-        name = _detect_default_browser()
+    # Determine effective browser under JARVIS Policy
+    name = get_jarvis_browser(browser_name)
 
-    # Specific browser → launch its own executable, exactly like the user would.
-    if name:
-        if _OS == "Darwin":
-            app = _MAC_APP_NAMES.get(name)
-            if app:
-                cmd = ["open", "-a", app] + ([url] if url else [])
-                try:
-                    subprocess.run(cmd, check=True, timeout=10)
-                    return f"Opened in {name}: {url}" if url else f"Opened {name}."
-                except Exception as e:
-                    print(f"[Browser] 'open -a {app}' failed ({e}), trying binary…")
-
-        spec = _resolve_browser(name)
-        exe  = spec.get("exe") if spec else None
-        if not exe and _OS == "Windows":
-            if name in ("opera", "operagx"):
-                exe = _find_opera_windows()
-            else:
-                exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
-        if exe:
+    # 1. On macOS with .app bundle
+    if _OS == "Darwin":
+        app = _MAC_APP_NAMES.get(name)
+        if app:
+            cmd = ["open", "-a", app] + ([url] if url else [])
             try:
-                subprocess.Popen(
-                    [exe, url] if url else [exe],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+                subprocess.run(cmd, check=True, timeout=10)
                 return f"Opened in {name}: {url}" if url else f"Opened {name}."
             except Exception as e:
-                print(f"[Browser] Native launch failed for {name}: {e}")
-        print(f"[Browser] '{name}' not found — falling back to default browser.")
+                print(f"[Browser] 'open -a {app}' failed ({e}), trying binary…")
+
+    # 2. Resolve executable path directly
+    exe = _resolve_browser_executable(name)
+    if exe:
+        try:
+            subprocess.Popen(
+                [exe, url] if url else [exe],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **_WIN_HIDE
+            )
+            return f"Opened in {name}: {url}" if url else f"Opened {name}."
+        except Exception as e:
+            print(f"[Browser] Native launch failed for {name} ({exe}): {e}")
+
+    # 3. If target browser executable not found, try host default browser executable if different
+    host_default = _detect_default_browser()
+    if host_default and host_default != name:
+        host_exe = _resolve_browser_executable(host_default)
+        if host_exe:
+            try:
+                subprocess.Popen(
+                    [host_exe, url] if url else [host_exe],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **_WIN_HIDE
+                )
+                return f"Opened in fallback browser ({host_default}): {url}" if url else f"Opened {host_default}."
+            except Exception:
+                pass
 
     if not url:
         return outcome.failed(
             "browser_control",
             "no browser was found and no address was given to open")
 
-    # Default browser via the OS — exactly like the user clicking a link.
+    # 4. OS shell association fallback (only if no binary was found)
     try:
         if _OS == "Windows":
             os.startfile(url)                       # ShellExecute → default browser
@@ -495,14 +683,6 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                 ["xdg-open", url],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-        # HANDED TO THE OPERATING SYSTEM, NOT CONFIRMED.
-        #
-        # os.startfile / open / xdg-open all return as soon as the request is
-        # accepted. None of them waits for a browser, and none reports whether
-        # the page loaded — the same gap that made open_app say "Opened
-        # Spotify." off the back of a shell starting. Unlike the playwright
-        # path above there is no page object here to read a url from, so this
-        # says what it actually knows.
         return outcome.unverified(
             "browser_control",
             "the address was handed to the system's default browser, which "
@@ -521,6 +701,359 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
         return outcome.failed(
             "browser_control",
             "no browser on this system could be opened", url=url)
+
+
+def _os_force_kill(pid: int) -> bool:
+    """Forcefully terminate an OS process by PID with safety checks."""
+    if pid in appidentity.own_pids():
+        print(f"[Browser] Refusing to kill PID {pid}: belongs to assistant.")
+        return False
+
+    current_os = platform.system()
+    sigkill = getattr(signal, "SIGKILL", 9)
+    try:
+        if current_os == "Windows":
+            res = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                check=False
+            )
+            return res.returncode == 0
+        else:
+            try:
+                os.kill(pid, sigkill)
+                return True
+            except OSError:
+                res = subprocess.run(["kill", "-9", str(pid)], capture_output=True, check=False)
+                return res.returncode == 0
+    except Exception as e:
+        print(f"[Browser] OS kill failed for PID {pid}: {e}")
+        return False
+
+
+class NativeTabRecord:
+    """Represents a natively opened browser tab with metadata for handle tracking."""
+    def __init__(self, url: str, browser: Optional[str] = None, title: Optional[str] = None):
+        self.url = url
+        self.browser = browser or ""
+        self.title = title or ""
+        self.timestamp = time.time()
+        clean = url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
+        self.domain = clean.split(".")[0] if clean else ""
+
+
+class NativeTabTracker:
+    """Thread-safe registry of natively opened browser tabs and URLs."""
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._tabs: list[NativeTabRecord] = []
+
+    def record(self, url: str, browser: Optional[str] = None, title: Optional[str] = None) -> NativeTabRecord:
+        with self._lock:
+            rec = NativeTabRecord(url=url, browser=browser, title=title)
+            self._tabs.append(rec)
+            if len(self._tabs) > 50:
+                self._tabs.pop(0)
+            return rec
+
+    def find_candidates(self, query: Optional[str] = None) -> list[NativeTabRecord]:
+        with self._lock:
+            if not query:
+                return list(reversed(self._tabs))
+            q = query.lower().strip()
+            matches = []
+            for rec in reversed(self._tabs):
+                if (
+                    q in rec.url.lower()
+                    or q in rec.title.lower()
+                    or (rec.domain and q in rec.domain.lower())
+                    or (rec.browser and q in rec.browser.lower())
+                ):
+                    matches.append(rec)
+            return matches
+
+    def pop_latest(self, query: Optional[str] = None) -> Optional[NativeTabRecord]:
+        with self._lock:
+            candidates = self.find_candidates(query)
+            if candidates:
+                rec = candidates[0]
+                if rec in self._tabs:
+                    self._tabs.remove(rec)
+                return rec
+            return None
+
+    def list_tabs(self) -> list[dict]:
+        with self._lock:
+            return [
+                {
+                    "url": r.url,
+                    "domain": r.domain,
+                    "browser": r.browser,
+                    "title": r.title,
+                    "age_sec": round(time.time() - r.timestamp, 1)
+                }
+                for r in reversed(self._tabs)
+            ]
+
+
+_native_tracker = NativeTabTracker()
+
+
+def open_url(url: str, browser: Optional[str] = None) -> str:
+    """
+    Standardized, lifecycle-tracked URL dispatcher across JARVIS.
+    Records the navigation in NativeTabTracker, normalizes the address,
+    and opens the page natively according to the JARVIS Default Browser Policy.
+
+    NOTE: WhatsApp Web and Telegram Web URLs are ALWAYS routed to the persistent
+    JARVIS browser session (~/.jarvis_profiles/common_session) so that logins and
+    sessions persist permanently without QR code prompts on subsequent launches.
+    """
+    norm_url = _normalize_url(url)
+    lower = norm_url.lower()
+    if any(k in lower for k in ("web.whatsapp.com", "web.telegram.org", "whatsapp.com", "telegram.org")):
+        sess = _registry.get(browser)
+        return sess.run(sess.go_to(norm_url))
+
+    effective_browser = get_jarvis_browser(browser)
+    rec = _native_tracker.record(url=norm_url, browser=effective_browser)
+    res = _open_native(norm_url, effective_browser)
+    _registry.note_native_url(norm_url)
+    return res
+
+
+def _get_window_list() -> list[dict]:
+    """Returns a list of visible top-level windows with HWND, PID, and title safely without hanging."""
+    windows: list[dict] = []
+    if _OS == "Windows":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            WM_GETTEXT = 0x000D
+            SMTO_ABORTIFHUNG = 0x0002
+
+            def _enum_cb(hwnd, _):
+                if user32.IsWindowVisible(hwnd):
+                    buf = ctypes.create_unicode_buffer(512)
+                    res = ctypes.c_ulong()
+                    # Safe timeout query: aborts in 50ms if window thread is hung
+                    if user32.SendMessageTimeoutW(hwnd, WM_GETTEXT, 512, buf, SMTO_ABORTIFHUNG, 50, ctypes.byref(res)):
+                        title = buf.value.strip()
+                        if title:
+                            pid = ctypes.c_ulong()
+                            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                            windows.append({"hwnd": hwnd, "pid": pid.value, "title": title})
+                return True
+
+            CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            user32.EnumWindows(CB(_enum_cb), 0)
+        except Exception:
+            pass
+    return windows
+
+
+def _close_macos_tab(query: str, browser_name: str = "") -> bool:
+    """Closes matching tab in macOS scriptable browsers via AppleScript."""
+    browsers = [browser_name] if browser_name else ["Brave Browser", "Google Chrome", "Microsoft Edge", "Safari"]
+    for b in browsers:
+        if not b:
+            continue
+        script = f'''
+        tell application "{b}"
+            if it is running then
+                repeat with w in windows
+                    set tabIdx to 0
+                    repeat with t in tabs of w
+                        set tabIdx to tabIdx + 1
+                        if (URL of t contains "{query}") or (title of t contains "{query}") then
+                            close t
+                            return "ok"
+                        end if
+                    end repeat
+                end repeat
+            end if
+        end tell
+        '''
+        try:
+            res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=3)
+            if "ok" in res.stdout:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _close_native_tab(
+    title: Optional[str] = None,
+    url: Optional[str] = None,
+    browser: Optional[str] = None,
+    force: bool = False,
+) -> str:
+    """
+    Closes a tab in the user's native desktop browser (e.g. Brave, Chrome, Edge, Firefox)
+    when no Playwright automation session is active.
+
+    Escalation:
+      1. Identifies candidate window titles based on title, url, NativeTabTracker records, or browser name.
+      2. On macOS: attempts direct AppleScript tab handle closure.
+      3. On Windows: enumerates active window handles (HWND) to find matching window, restores & focuses, sends Ctrl+W.
+         Fallback: Windows Script Host AppActivate.
+      4. On Linux: wmctrl -a window activation + Ctrl+W.
+      5. If force=True and standard closure fails, locates the browser process and terminates it safely.
+    """
+    activated = False
+    focused_name = ""
+
+    # Build prioritized candidate search strings
+    candidates: list[str] = []
+    if title:
+        candidates.append(title.strip())
+        candidates.append(title.strip().capitalize())
+    if url:
+        clean_url = url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
+        if clean_url:
+            domain_name = clean_url.split(".")[0]
+            if domain_name and domain_name.lower() not in [c.lower() for c in candidates]:
+                candidates.append(domain_name.capitalize())
+                candidates.append(domain_name)
+
+    # Check tracked native tabs
+    tracked = _native_tracker.find_candidates(query=title or url)
+    for rec in tracked:
+        if rec.title and rec.title not in candidates:
+            candidates.append(rec.title)
+        if rec.domain and rec.domain.capitalize() not in candidates:
+            candidates.append(rec.domain.capitalize())
+            candidates.append(rec.domain)
+        if rec.browser and rec.browser.capitalize() not in candidates:
+            candidates.append(rec.browser.capitalize())
+
+    if browser:
+        candidates.append(browser.capitalize())
+        candidates.append(browser)
+
+    effective_b = get_jarvis_browser(browser)
+    if effective_b:
+        if effective_b.capitalize() not in candidates:
+            candidates.append(effective_b.capitalize())
+        if effective_b not in candidates:
+            candidates.append(effective_b)
+
+    for b in ["Brave", "Chrome", "Edge", "Firefox", "Opera", "Vivaldi"]:
+        if b not in candidates:
+            candidates.append(b)
+
+    # ── macOS Tab Handle Execution ──
+    if _OS == "Darwin":
+        query_kw = title or (tracked[0].domain if tracked else "") or (url.split("//")[-1].split(".")[0] if url else "")
+        if query_kw and _close_macos_tab(query_kw, browser or ""):
+            _native_tracker.pop_latest(query=title or url)
+            return f"Closed native browser tab ({query_kw})."
+
+        for cand in candidates:
+            if not cand:
+                continue
+            script = (
+                f'tell application "System Events"\n'
+                f'  set frontmost of (first process whose name contains "{cand}") to true\n'
+                f'end tell'
+            )
+            try:
+                r = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=2)
+                if r.returncode == 0:
+                    activated = True
+                    focused_name = cand
+                    break
+            except Exception:
+                continue
+
+    # ── Windows Window Handle & Activation Execution ──
+    elif _OS == "Windows":
+        # Strategy A: Window handle (HWND) enumeration
+        win_list = _get_window_list()
+        matching_hwnd = None
+        for cand in candidates:
+            if not cand:
+                continue
+            cand_l = cand.lower()
+            for win in win_list:
+                w_title = win.get("title", "").lower()
+                if cand_l in w_title:
+                    matching_hwnd = win.get("hwnd")
+                    focused_name = win.get("title")
+                    break
+            if matching_hwnd:
+                break
+
+        if matching_hwnd:
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                user32.ShowWindow(matching_hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(matching_hwnd)
+                activated = True
+            except Exception:
+                pass
+
+        # Strategy B: PowerShell AppActivate
+        if not activated:
+            for cand in candidates:
+                if not cand:
+                    continue
+                try:
+                    cmd = [
+                        "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        f'(New-Object -ComObject WScript.Shell).AppActivate("{cand}")'
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=3, **_WIN_HIDE)
+                    if res.stdout and "True" in res.stdout:
+                        activated = True
+                        focused_name = cand
+                        break
+                except Exception:
+                    continue
+
+    # ── Linux wmctrl Execution ──
+    elif _OS == "Linux":
+        for cand in candidates:
+            if not cand:
+                continue
+            try:
+                r = subprocess.run(["wmctrl", "-a", cand], capture_output=True, timeout=2)
+                if r.returncode == 0:
+                    activated = True
+                    focused_name = cand
+                    break
+            except Exception:
+                continue
+
+    if activated:
+        time.sleep(0.25)
+        try:
+            import pyautogui
+            close_key = "command" if _OS == "Darwin" else "ctrl"
+            pyautogui.hotkey(close_key, "w")
+            _native_tracker.pop_latest(query=title or url)
+            target_desc = title or focused_name or "current tab"
+            return f"Closed native browser tab ({target_desc})."
+        except Exception as e:
+            return f"Focused browser window ({focused_name}) but failed to send close tab shortcut: {e}"
+
+    if force:
+        target_browser = (browser or get_jarvis_browser() or "chrome").lower()
+        exclude = appidentity.own_pids()
+        for p in psutil.process_iter(['pid', 'name']):
+            try:
+                if p.pid in exclude:
+                    continue
+                if target_browser in p.name().lower():
+                    if _os_force_kill(p.pid):
+                        _native_tracker.pop_latest(query=title or url)
+                        return f"Forcefully terminated native browser process ({p.name()}, PID {p.pid})."
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+    return f"No active browser session or window found to close tabs from (searched: {', '.join(candidates[:3])})."
 
 
 class _BrowserSession:
@@ -662,14 +1195,18 @@ class _BrowserSession:
             print(f"[Browser] ✅ Safari launched")
             return
 
-        profile = _real_profile_dir(self.browser_name)
+        # JARVIS DEDICATED PERSISTENT PROFILE:
+        # A single, consistent user data directory used across all JARVIS sessions.
+        # This guarantees WhatsApp Web, Telegram Web, and all sign-ins persist
+        # without ever resetting or presenting a new QR code on launch.
+        profile = str(get_jarvis_common_profile_dir())
 
         kwargs = {
             "headless":    False,
             "slow_mo":     0,
             "viewport":    None,
             "no_viewport": True,
-            "timeout":     25_000,
+            "timeout":     30_000,
             "args": [
                 "--start-maximized",
                 "--disable-blink-features=AutomationControlled",
@@ -690,51 +1227,26 @@ class _BrowserSession:
             + (f" @ {exe}" if exe else "")
         )
 
-        # ASK FIRST, INSTEAD OF WAITING 25 SECONDS TO BE TOLD.
-        #
-        # A Chromium profile can only be open once. If the user already has the
-        # browser running — which is the normal state of a browser — then
-        # launch_persistent_context on their real profile cannot succeed, and
-        # the way it fails is by sitting on the timeout above before raising.
-        # Every "open this page" then cost twenty-five seconds of nothing
-        # before the fallback even started, and the fallback is a profile with
-        # none of their sign-ins in it.
-        #
-        # Whether the browser is running is a question the process table
-        # answers in milliseconds, and core/appidentity was already built to
-        # ask it. Knowing up front turns a long silence into an immediate,
-        # explainable outcome.
-        already = appidentity.running(self.browser_name)
-        if already:
-            print(f"[Browser] {self.browser_name} is already running "
-                  f"({len(already)} processes) — its profile is locked, so the "
-                  f"separate automation profile will be used.")
-        else:
-            try:
-                self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
-                self._page = await self._adopt_page()
-                self.profile_kind = "real"
-                print(f"[Browser] ✅ Launched [{label}] profile={profile}")
-                return
-            except Exception as e:
-                print(f"[Browser] ⚠️  Real profile failed for {label}: {e}")
-
-        # The real profile could not be opened (browser already open / locked
-        # profile / newer Chrome versions block the real profile under
-        # automation). Fall back to a persistent JARVIS automation profile —
-        # accounts logged in here once stay logged in on later sessions too.
-        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
-        Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
-        print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
-
         try:
-            self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
+            self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             self._page = await self._adopt_page()
-            self.profile_kind = "separate"
-            print(f"[Browser] ✅ Launched [{label}] with JARVIS profile "
-                  f"(sign-ins persist across sessions)")
-        except Exception as e2:
-            raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
+            self.profile_kind = "jarvis_common"
+            print(f"[Browser] ✅ Launched [{label}] with JARVIS common profile (session persistent): {profile}")
+            return
+        except Exception as e:
+            print(f"[Browser] ⚠️ Persistent context launch failed with {label}: {e}")
+            if channel != "chrome" and engine_name == "chromium":
+                try:
+                    kwargs.pop("executable_path", None)
+                    kwargs["channel"] = "chrome"
+                    self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
+                    self._page = await self._adopt_page()
+                    self.profile_kind = "jarvis_common"
+                    print(f"[Browser] ✅ Launched Chrome channel fallback with JARVIS common profile: {profile}")
+                    return
+                except Exception as e2:
+                    raise RuntimeError(f"Could not launch browser with JARVIS common profile: {e2}") from e2
+            raise RuntimeError(f"Could not launch browser with JARVIS common profile: {e}") from e
 
 
     async def _get_page(self) -> Page:
@@ -936,15 +1448,190 @@ class _BrowserSession:
             return await self.go_to(url)
         return "New tab opened."
 
-    async def close_tab(self) -> str:
-        page = self._page
-        if page and not page.is_closed():
-            ctx   = page.context
-            await page.close()
-            pages = ctx.pages
+    def _update_active_page(self):
+        """Update active page pointer to the most recent non-closed page."""
+        try:
+            pages = [p for p in (self._context.pages if self._context else []) if not p.is_closed()]
             self._page = pages[-1] if pages else None
-            return "Tab closed."
-        return "No active tab to close."
+        except Exception:
+            self._page = None
+
+    async def _get_browser_pid(self) -> Optional[int]:
+        """Resolve the OS process ID for the browser parent process."""
+        # 1. Try CDP SystemInfo if Chromium
+        if self._context and self._page and not self._page.is_closed():
+            try:
+                cdp = await asyncio.wait_for(self._context.new_cdp_session(self._page), timeout=1.0)
+                sys_info = await asyncio.wait_for(cdp.send("SystemInfo.getProcessInfo"), timeout=1.0)
+                for proc in sys_info.get("processInfo", []):
+                    if proc.get("type") == "browser":
+                        return int(proc.get("id"))
+            except Exception:
+                pass
+
+        # 2. Match active browser process via psutil while protecting own application
+        try:
+            exclude_pids = appidentity.own_pids()
+            bname = (self.browser_name or "").lower()
+            for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if p.pid in exclude_pids:
+                        continue
+                    pname = p.name().lower()
+                    if bname in pname or (bname == "edge" and "msedge" in pname) or (bname == "chrome" and "chrome" in pname):
+                        cmd = p.cmdline()
+                        if not any("--type=" in arg or "-contentproc" in arg for arg in cmd):
+                            return p.pid
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            pass
+        return None
+
+    async def _get_tab_renderer_pid(self, page: Page) -> Optional[int]:
+        """Find the specific OS renderer/content process ID for a given page/tab."""
+        # 1. Try CDP SystemInfo on the page context
+        try:
+            cdp = await asyncio.wait_for(page.context.new_cdp_session(page), timeout=1.0)
+            sys_info = await asyncio.wait_for(cdp.send("SystemInfo.getProcessInfo"), timeout=1.0)
+            for proc in sys_info.get("processInfo", []):
+                if proc.get("type") == "renderer":
+                    return int(proc.get("id"))
+        except Exception:
+            pass
+
+        # 2. Inspect child processes of browser via psutil
+        browser_pid = await self._get_browser_pid()
+        if browser_pid:
+            try:
+                exclude_pids = appidentity.own_pids()
+                bp = psutil.Process(browser_pid)
+                children = bp.children(recursive=True)
+                for child in children:
+                    try:
+                        if child.pid in exclude_pids:
+                            continue
+                        cmd = child.cmdline()
+                        # Chromium renderer or Firefox content process
+                        if any("--type=renderer" in arg for arg in cmd) or any("-contentproc" in arg for arg in cmd):
+                            return child.pid
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception:
+                pass
+        return None
+
+    _os_force_kill = staticmethod(_os_force_kill)
+
+    async def close_tab(
+        self,
+        url: Optional[str] = None,
+        title: Optional[str] = None,
+        force: bool = False,
+        timeout: float = 2.0
+    ) -> str:
+        """
+        Close a browser tab following a 3-tier escalation:
+          Tier 1: Graceful Playwright/CDP close (page.close(run_before_unload=False))
+          Tier 2: Raw CDP Target.closeTarget
+          Tier 3: Process-tree PID resolution and OS-level forceful termination (taskkill on Windows, kill -9 on macOS/Linux)
+        """
+        if not self._context:
+            return _close_native_tab(
+                url=url,
+                title=title,
+                browser=self.browser_name,
+                force=force,
+            )
+
+        pages = [p for p in self._context.pages if not p.is_closed()]
+        if not pages:
+            self._page = None
+            return "No active tab to close."
+
+        target_page: Optional[Page] = None
+        if url or title:
+            for p in pages:
+                if url and url.lower() in p.url.lower():
+                    target_page = p
+                    break
+                if title:
+                    try:
+                        t = await asyncio.wait_for(p.title(), timeout=0.5)
+                        if title.lower() in t.lower():
+                            target_page = p
+                            break
+                    except Exception:
+                        pass
+            if target_page is None:
+                criteria = []
+                if url:
+                    criteria.append(f"url containing '{url}'")
+                if title:
+                    criteria.append(f"title containing '{title}'")
+                return f"No open tab found matching {' and '.join(criteria)}."
+        else:
+            target_page = self._page if (self._page and not self._page.is_closed()) else pages[-1]
+
+        target_url = target_page.url
+
+        # ── Tier 1: Graceful Playwright close ─────────────────────────────────
+        if not force:
+            try:
+                print(f"[Browser] Tier 1: Attempting graceful close on tab: {target_url}")
+                await asyncio.wait_for(target_page.close(run_before_unload=False), timeout=timeout)
+                if target_page.is_closed():
+                    self._update_active_page()
+                    return f"Tab closed successfully (Tier 1: graceful close): {target_url}"
+            except Exception as t1_err:
+                print(f"[Browser] Tier 1 close failed or timed out ({t1_err}). Escalating to Tier 2...")
+
+        # ── Tier 2: Raw CDP Target.closeTarget ────────────────────────────────
+        try:
+            print(f"[Browser] Tier 2: Attempting raw CDP Target.closeTarget...")
+            cdp = await asyncio.wait_for(target_page.context.new_cdp_session(target_page), timeout=1.5)
+            info = await asyncio.wait_for(cdp.send("Target.getTargetInfo"), timeout=1.5)
+            target_id = info.get("targetInfo", {}).get("targetId")
+            if target_id:
+                res = await asyncio.wait_for(
+                    cdp.send("Target.closeTarget", {"targetId": target_id}),
+                    timeout=1.5
+                )
+                if res.get("success", False):
+                    try:
+                        await asyncio.wait_for(target_page.close(run_before_unload=False), timeout=0.5)
+                    except Exception:
+                        pass
+                    self._update_active_page()
+                    return f"Tab closed successfully (Tier 2: raw CDP Target.closeTarget): {target_url}"
+        except Exception as t2_err:
+            print(f"[Browser] Tier 2 close failed ({t2_err}). Escalating to Tier 3...")
+
+        # ── Tier 3: Process-tree PID resolution & OS forceful kill ────────────
+        print(f"[Browser] Tier 3: Resolving renderer PID and applying OS-level forceful termination...")
+        renderer_pid = await self._get_tab_renderer_pid(target_page)
+        if renderer_pid:
+            killed = _os_force_kill(renderer_pid)
+            if killed:
+                try:
+                    await asyncio.wait_for(target_page.close(run_before_unload=False), timeout=0.5)
+                except Exception:
+                    pass
+                self._update_active_page()
+                return f"Tab forcefully terminated (Tier 3: OS process kill, PID {renderer_pid}): {target_url}"
+
+        # If specific renderer PID could not be found, and only 1 tab exists or all tabs are hung
+        remaining = [p for p in self._context.pages if not p.is_closed()]
+        if len(remaining) <= 1:
+            browser_pid = await self._get_browser_pid()
+            if browser_pid:
+                killed = _os_force_kill(browser_pid)
+                if killed:
+                    self._context = self._page = None
+                    return f"Tab and browser process forcefully terminated (Tier 3: OS process kill, PID {browser_pid})."
+
+        self._update_active_page()
+        return f"Tab closure escalation completed for: {target_url}"
 
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
@@ -983,6 +1670,449 @@ class _BrowserSession:
         await self._async_close()
         return f"{self.browser_name} closed."
 
+    async def open_whatsapp(self) -> str:
+        """Opens WhatsApp Web in JARVIS's persistent common session or switches to the active tab."""
+        page = await self._get_page()
+        target_page = None
+        if self._context:
+            for p in self._context.pages:
+                if not p.is_closed() and "web.whatsapp.com" in p.url.lower():
+                    target_page = p
+                    break
+        if target_page:
+            self._page = target_page
+            await target_page.bring_to_front()
+            try:
+                await target_page.wait_for_load_state("domcontentloaded", timeout=5_000)
+            except Exception:
+                pass
+        else:
+            if page.url and page.url != "about:blank":
+                page = await self._context.new_page()
+                self._page = page
+            await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded", timeout=30_000)
+
+        return await self._check_whatsapp_state(self._page)
+
+    async def _check_whatsapp_state(self, page: Page) -> str:
+        """Determines if WhatsApp Web is logged in or waiting for QR code."""
+        for _ in range(8):
+            chat_indicators = [
+                'div[contenteditable="true"][data-tab="3"]',
+                '[aria-label="Search input textbox"]',
+                '[aria-label="Search or start new chat"]',
+                '[data-testid="chat-list-search"]',
+                '#side',
+                '#pane-side',
+            ]
+            for sel in chat_indicators:
+                try:
+                    if await page.locator(sel).count() > 0:
+                        return outcome.done(
+                            "browser_control",
+                            action="open_whatsapp",
+                            status="logged_in",
+                            detail="WhatsApp Web is open and active (session loaded). Ready to use.",
+                            verified=True,
+                        )
+                except Exception:
+                    pass
+
+            qr_indicators = [
+                'canvas[aria-label="Scan me!"]',
+                'div[data-ref]',
+                'div[data-testid="qrcode"]',
+                'canvas',
+            ]
+            for sel in qr_indicators:
+                try:
+                    if await page.locator(sel).count() > 0:
+                        return outcome.unverified(
+                            "browser_control",
+                            "WhatsApp Web is open. A QR code is displayed on your screen — please scan it once with your phone. The session will be saved permanently in JARVIS common storage.",
+                            action="open_whatsapp",
+                            status="qr_code_required",
+                        )
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+
+        return f"WhatsApp Web is open at {page.url}."
+
+    async def open_telegram(self) -> str:
+        """Opens Telegram Web in JARVIS's persistent common session or switches to the active tab."""
+        page = await self._get_page()
+        target_page = None
+        if self._context:
+            for p in self._context.pages:
+                if not p.is_closed() and "web.telegram.org" in p.url.lower():
+                    target_page = p
+                    break
+        if target_page:
+            self._page = target_page
+            await target_page.bring_to_front()
+            try:
+                await target_page.wait_for_load_state("domcontentloaded", timeout=5_000)
+            except Exception:
+                pass
+        else:
+            if page.url and page.url != "about:blank":
+                page = await self._context.new_page()
+                self._page = page
+            await page.goto("https://web.telegram.org/a/", wait_until="domcontentloaded", timeout=30_000)
+
+        return await self._check_telegram_state(self._page)
+
+    async def _check_telegram_state(self, page: Page) -> str:
+        """Determines if Telegram Web is logged in or waiting for QR/phone login."""
+        for _ in range(8):
+            chat_indicators = [
+                'input.chatlist-search-input',
+                'input.input-search-input',
+                '.input-search input',
+                '#telegram-search-input',
+                '.chat-list',
+                '#middle-column',
+            ]
+            for sel in chat_indicators:
+                try:
+                    if await page.locator(sel).count() > 0:
+                        return outcome.done(
+                            "browser_control",
+                            action="open_telegram",
+                            status="logged_in",
+                            detail="Telegram Web is open and active (session loaded). Ready to use.",
+                            verified=True,
+                        )
+                except Exception:
+                    pass
+
+            qr_indicators = [
+                '.qr-container',
+                '.auth-image',
+                'button:has-text("Log in by QR Code")',
+                'input[type="tel"]',
+                '.login-page',
+            ]
+            for sel in qr_indicators:
+                try:
+                    if await page.locator(sel).count() > 0:
+                        return outcome.unverified(
+                            "browser_control",
+                            "Telegram Web is open. Please log in on the browser window (via QR code or phone number). The session will be saved permanently in JARVIS common storage.",
+                            action="open_telegram",
+                            status="login_required",
+                        )
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+
+        return f"Telegram Web is open at {page.url}."
+
+    async def send_whatsapp_message(self, receiver: str, message: str) -> str:
+        """Autonomously finds a contact, types a message, and sends it via WhatsApp Web."""
+        if not receiver or not message:
+            return outcome.failed("send_message", "Both recipient and message text are required.", platform="WhatsApp")
+
+        await self.open_whatsapp()
+        page = self._page
+        if not page:
+            return outcome.failed("send_message", "Could not acquire WhatsApp Web page.", platform="WhatsApp")
+
+        try:
+            if await page.locator('canvas, [data-testid="qrcode"], div[data-ref]').count() > 0:
+                if await page.locator('#side [contenteditable="true"], [data-testid="chat-list-search"]').count() == 0:
+                    return outcome.unverified(
+                        "send_message",
+                        "WhatsApp Web QR code is showing. Please scan the QR code in the browser to log in once.",
+                        platform="WhatsApp",
+                        to=receiver
+                    )
+        except Exception:
+            pass
+
+        search_selectors = [
+            'div[contenteditable="true"][data-tab="3"]',
+            '[aria-label="Search input textbox"]',
+            '[aria-label="Search or start new chat"]',
+            '[data-testid="chat-list-search"]',
+            '#side div[contenteditable="true"]',
+        ]
+        search_el = None
+        for sel in search_selectors:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                search_el = loc.first
+                break
+
+        if search_el is None:
+            return outcome.failed(
+                "send_message",
+                "WhatsApp search bar could not be located. Ensure WhatsApp Web is logged in.",
+                platform="WhatsApp",
+                to=receiver
+            )
+
+        try:
+            await search_el.click(timeout=5_000)
+            await search_el.fill("")
+            await search_el.type(receiver, delay=40)
+            await asyncio.sleep(1.2)
+        except Exception as e:
+            return outcome.failed("send_message", f"Failed typing into WhatsApp search: {e}", platform="WhatsApp", to=receiver)
+
+        try:
+            contact_loc = page.locator(f'#pane-side span[title*="{receiver}" i], #side span[title*="{receiver}" i]')
+            if await contact_loc.count() > 0:
+                await contact_loc.first.click(timeout=5_000)
+            else:
+                list_items = page.locator('#pane-side div[role="listitem"]')
+                if await list_items.count() > 0:
+                    await list_items.first.click(timeout=5_000)
+                else:
+                    await page.keyboard.press("Enter")
+        except Exception:
+            await page.keyboard.press("Enter")
+
+        await asyncio.sleep(1.0)
+
+        msg_selectors = [
+            'footer div[contenteditable="true"][data-tab="10"]',
+            'footer div[contenteditable="true"]',
+            'div[title="Type a message"]',
+            '[data-testid="conversation-compose-box-input"]',
+            '[aria-label="Type a message"]',
+            'div[role="textbox"][data-tab="10"]',
+        ]
+        msg_el = None
+        for sel in msg_selectors:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                msg_el = loc.first
+                break
+
+        if msg_el is None:
+            return outcome.failed(
+                "send_message",
+                f"Could not open chat with '{receiver}' or find compose input.",
+                platform="WhatsApp",
+                to=receiver
+            )
+
+        try:
+            await msg_el.click(timeout=5_000)
+            await msg_el.fill(message)
+            await asyncio.sleep(0.3)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(0.8)
+
+            send_btn = page.locator('[data-testid="send"], button span[data-icon="send"], button[aria-label="Send"]')
+            if await send_btn.count() > 0:
+                try:
+                    await send_btn.first.click(timeout=2_000)
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+            return outcome.done(
+                "send_message",
+                platform="WhatsApp",
+                to=receiver,
+                verified=True
+            )
+        except Exception as e:
+            return outcome.failed("send_message", f"Failed sending WhatsApp message: {e}", platform="WhatsApp", to=receiver)
+
+    async def send_telegram_message(self, receiver: str, message: str) -> str:
+        """Autonomously finds a contact, types a message, and sends it via Telegram Web."""
+        if not receiver or not message:
+            return outcome.failed("send_message", "Both recipient and message text are required.", platform="Telegram")
+
+        await self.open_telegram()
+        page = self._page
+        if not page:
+            return outcome.failed("send_message", "Could not acquire Telegram Web page.", platform="Telegram")
+
+        try:
+            login_loc = page.locator('.qr-container, .auth-image, button:has-text("Log in by QR Code"), input[type="tel"]')
+            if await login_loc.count() > 0:
+                if await page.locator('input.chatlist-search-input, .input-search input').count() == 0:
+                    return outcome.unverified(
+                        "send_message",
+                        "Telegram Web login is required. Please log in on the opened browser window once.",
+                        platform="Telegram",
+                        to=receiver
+                    )
+        except Exception:
+            pass
+
+        search_selectors = [
+            'input.chatlist-search-input',
+            'input.input-search-input',
+            '.input-search input',
+            'input[type="text"][placeholder*="Search"]',
+            '#telegram-search-input',
+        ]
+        search_el = None
+        for sel in search_selectors:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                search_el = loc.first
+                break
+
+        if search_el is None:
+            return outcome.failed(
+                "send_message",
+                "Telegram search input could not be located. Ensure Telegram Web is logged in.",
+                platform="Telegram",
+                to=receiver
+            )
+
+        try:
+            await search_el.click(timeout=5_000)
+            await search_el.fill("")
+            await search_el.type(receiver, delay=40)
+            await asyncio.sleep(1.2)
+        except Exception as e:
+            return outcome.failed("send_message", f"Failed typing into Telegram search: {e}", platform="Telegram", to=receiver)
+
+        try:
+            res_item = page.locator(f'.chat-list .ListItem:has-text("{receiver}"), .search-group .chatlist-chat')
+            if await res_item.count() > 0:
+                await res_item.first.click(timeout=5_000)
+            else:
+                await page.keyboard.press("Enter")
+        except Exception:
+            await page.keyboard.press("Enter")
+
+        await asyncio.sleep(1.0)
+
+        msg_selectors = [
+            'div.input-message-input[contenteditable="true"]',
+            '.chat-input-main [contenteditable="true"]',
+            'div[contenteditable="true"][data-peer-id]',
+            '#editable-message-text',
+            'div[contenteditable="true"]',
+        ]
+        msg_el = None
+        for sel in msg_selectors:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                msg_el = loc.first
+                break
+
+        if msg_el is None:
+            return outcome.failed(
+                "send_message",
+                f"Could not open chat with '{receiver}' or locate compose input.",
+                platform="Telegram",
+                to=receiver
+            )
+
+        try:
+            await msg_el.click(timeout=5_000)
+            await msg_el.fill(message)
+            await asyncio.sleep(0.3)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(0.8)
+
+            send_btn = page.locator('.btn-send-container button, button.send')
+            if await send_btn.count() > 0:
+                try:
+                    await send_btn.first.click(timeout=2_000)
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+            return outcome.done(
+                "send_message",
+                platform="Telegram",
+                to=receiver,
+                verified=True
+            )
+        except Exception as e:
+            return outcome.failed("send_message", f"Failed sending Telegram message: {e}", platform="Telegram", to=receiver)
+
+    async def read_whatsapp_messages(self, contact: Optional[str] = None, limit: int = 5) -> str:
+        """Reads recent messages from WhatsApp Web."""
+        await self.open_whatsapp()
+        page = self._page
+        if not page:
+            return "Could not acquire WhatsApp Web page."
+
+        if contact:
+            search_el = page.locator('div[contenteditable="true"][data-tab="3"], [aria-label="Search input textbox"], #side [contenteditable="true"]').first
+            if await search_el.count() > 0:
+                try:
+                    await search_el.click(timeout=3_000)
+                    await search_el.fill(contact)
+                    await asyncio.sleep(1.2)
+                    contact_item = page.locator(f'#pane-side span[title*="{contact}" i]').first
+                    if await contact_item.count() > 0:
+                        await contact_item.click(timeout=3_000)
+                    else:
+                        await page.keyboard.press("Enter")
+                    await asyncio.sleep(1.0)
+                except Exception:
+                    pass
+
+        try:
+            containers = page.locator('div[data-testid="msg-container"], div.message-in, div.message-out')
+            total = await containers.count()
+            if total == 0:
+                return f"No messages visible for {contact or 'current chat'} on WhatsApp."
+            start_idx = max(0, total - limit)
+            messages = []
+            for i in range(start_idx, total):
+                t = await containers.nth(i).inner_text()
+                lines = [l.strip() for l in t.splitlines() if l.strip()]
+                clean = " | ".join(lines)
+                if clean:
+                    messages.append(clean)
+            return f"Recent WhatsApp messages ({contact or 'current chat'}):\n" + "\n".join(f"• {m}" for m in messages)
+        except Exception as e:
+            return f"Error reading WhatsApp messages: {e}"
+
+    async def read_telegram_messages(self, contact: Optional[str] = None, limit: int = 5) -> str:
+        """Reads recent messages from Telegram Web."""
+        await self.open_telegram()
+        page = self._page
+        if not page:
+            return "Could not acquire Telegram Web page."
+
+        if contact:
+            search_el = page.locator('input.chatlist-search-input, .input-search input, input[type="text"]').first
+            if await search_el.count() > 0:
+                try:
+                    await search_el.click(timeout=3_000)
+                    await search_el.fill(contact)
+                    await asyncio.sleep(1.2)
+                    res_item = page.locator(f'.chat-list .ListItem:has-text("{contact}")').first
+                    if await res_item.count() > 0:
+                        await res_item.click(timeout=3_000)
+                    else:
+                        await page.keyboard.press("Enter")
+                    await asyncio.sleep(1.0)
+                except Exception:
+                    pass
+
+        try:
+            containers = page.locator('.message, .Message, .message-content')
+            total = await containers.count()
+            if total == 0:
+                return f"No messages visible for {contact or 'current chat'} on Telegram."
+            start_idx = max(0, total - limit)
+            messages = []
+            for i in range(start_idx, total):
+                t = await containers.nth(i).inner_text()
+                lines = [l.strip() for l in t.splitlines() if l.strip()]
+                clean = " | ".join(lines)
+                if clean:
+                    messages.append(clean)
+            return f"Recent Telegram messages ({contact or 'current chat'}):\n" + "\n".join(f"• {m}" for m in messages)
+        except Exception as e:
+            return f"Error reading Telegram messages: {e}"
+
 class _SessionRegistry:
     """Manages all active browser sessions."""
 
@@ -1019,7 +2149,7 @@ class _SessionRegistry:
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
         if not browser_name:
-            browser_name = self._active_browser or _detect_default_browser()
+            browser_name = self._active_browser or get_jarvis_browser()
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
         sess = self._get_or_create(browser_name)
         self._active_browser = browser_name
@@ -1089,6 +2219,14 @@ def browser_control(
         _log(player, result)
         return result
 
+    if action in ("list_tabs", "list_open_tabs"):
+        tabs = _native_tracker.list_tabs()
+        result = f"Tracked native tabs ({len(tabs)}):\n" + "\n".join(
+            f"  • {t['domain'].capitalize() or 'Tab'}: {t['url']} ({t['age_sec']}s ago)" for t in tabs
+        ) if tabs else "No active native tabs tracked."
+        _log(player, result)
+        return result
+
     if action == "close_all":
         result = _registry.close_all()
         _log(player, result)
@@ -1096,16 +2234,115 @@ def browser_control(
 
     if action == "close":
         target = browser or _registry._active_browser
-        result = _registry.close_one(target) if target else "No browser specified."
+        if target and _registry.has(target):
+            result = _registry.close_one(target)
+        elif target:
+            try:
+                from actions.computer_control import _close_app
+                outcome_res = _close_app(target)
+                result = f"Closed {target}." if "done" in str(outcome_res).lower() else f"No active session for: {target}"
+            except Exception:
+                result = _registry.close_one(target)
+        else:
+            result = "No browser specified."
         _log(player, result)
         return result
 
-    # ── Navigation is ALWAYS native ──────────────────────────────────────────
+    if action == "close_tab" and not _registry.has(browser):
+        result = _close_native_tab(
+            title=params.get("title"),
+            url=params.get("url"),
+            browser=browser,
+            force=bool(params.get("force", False)),
+        )
+        _log(player, result)
+        return result
+
+    if action == "set_default_browser":
+        target = (browser or params.get("browser") or params.get("name") or "").strip().lower()
+        if not target:
+            result = "No browser specified to set as default."
+        else:
+            norm = _ALIASES.get(target, target)
+            try:
+                from memory import config_manager
+                config_manager.save_default_browser(norm)
+                result = f"JARVIS default browser set to: {norm}"
+            except Exception as e:
+                result = f"Failed to save default browser: {e}"
+        _log(player, result)
+        return result
+
+    if action in ("get_browser_config", "browser_config"):
+        try:
+            from memory import config_manager
+            cfg_browser = config_manager.get_default_browser()
+        except Exception:
+            cfg_browser = "chrome"
+        host_default = _detect_default_browser()
+        active_effective = get_jarvis_browser()
+        exe = _resolve_browser_executable(active_effective)
+        result = (
+            f"JARVIS Default Browser Policy:\n"
+            f"  • Configured: {cfg_browser}\n"
+            f"  • Active Effective: {active_effective}\n"
+            f"  • Executable: {exe or 'Not Found (Will fallback to OS association)'}\n"
+            f"  • Host OS Default: {host_default}"
+        )
+        _log(player, result)
+        return result
+
+    # ── WhatsApp and Telegram direct actions (Autonomous Browser Automation) ─
+    if action in ("open_whatsapp", "whatsapp"):
+        sess = _registry.get(browser)
+        result = sess.run(sess.open_whatsapp())
+        _log(player, result)
+        return result
+
+    if action in ("open_telegram", "telegram"):
+        sess = _registry.get(browser)
+        result = sess.run(sess.open_telegram())
+        _log(player, result)
+        return result
+
+    if action in ("whatsapp_send", "send_whatsapp"):
+        receiver = params.get("receiver") or params.get("to") or params.get("contact") or ""
+        text = params.get("text") or params.get("message") or params.get("message_text") or ""
+        sess = _registry.get(browser)
+        result = sess.run(sess.send_whatsapp_message(receiver, text))
+        _log(player, result)
+        return result
+
+    if action in ("telegram_send", "send_telegram"):
+        receiver = params.get("receiver") or params.get("to") or params.get("contact") or ""
+        text = params.get("text") or params.get("message") or params.get("message_text") or ""
+        sess = _registry.get(browser)
+        result = sess.run(sess.send_telegram_message(receiver, text))
+        _log(player, result)
+        return result
+
+    if action in ("whatsapp_read", "read_whatsapp"):
+        contact = params.get("contact") or params.get("receiver") or None
+        limit = int(params.get("limit", 5))
+        sess = _registry.get(browser)
+        result = sess.run(sess.read_whatsapp_messages(contact, limit))
+        _log(player, result)
+        return result
+
+    if action in ("telegram_read", "read_telegram"):
+        contact = params.get("contact") or params.get("receiver") or None
+        limit = int(params.get("limit", 5))
+        sess = _registry.get(browser)
+        result = sess.run(sess.read_telegram_messages(contact, limit))
+        _log(player, result)
+        return result
+
+    # ── Navigation is ALWAYS native (except WhatsApp / Telegram / active automation) ─
     # go_to / search / new_tab open the site in the user's own browser —
     # their own profile, logged-in accounts and start page; exactly as if the
     # user had opened it themselves. A controlled window with about:blank never
     # opens here. The only exception: if an automation flow is already running,
-    # navigation continues in that window (so multi-step tasks aren't split).
+    # or for WhatsApp/Telegram (which require persistent common session automation).
     if action in ("go_to", "search", "new_tab"):
         if _registry.has(browser):
             sess = _registry.get(browser)
@@ -1131,9 +2368,17 @@ def browser_control(
         else:
             nav_url = params.get("url", "").strip()
 
-        result = _open_native(nav_url, browser)
-        if result.startswith("Opened") and nav_url:
-            _registry.note_native_url(_normalize_url(nav_url))
+        # WhatsApp and Telegram ALWAYS route through JARVIS common automation session
+        if any(k in nav_url.lower() for k in ("web.whatsapp.com", "web.telegram.org", "whatsapp.com", "telegram.org")):
+            sess = _registry.get(browser)
+            try:
+                result = sess.run(sess.go_to(nav_url))
+            except Exception as e:
+                result = f"Browser error ({action}): {e}"
+            _log(player, result)
+            return result
+
+        result = open_url(nav_url, browser)
         _log(player, result)
         return result
 
@@ -1176,7 +2421,13 @@ def browser_control(
         elif action == "press":
             result = sess.run(sess.press(params.get("key", "Enter")))
         elif action == "close_tab":
-            result = sess.run(sess.close_tab())
+            result = sess.run(
+                sess.close_tab(
+                    url=params.get("url"),
+                    title=params.get("title"),
+                    force=bool(params.get("force", False)),
+                )
+            )
         elif action == "screenshot":
             result = sess.run(sess.screenshot(params.get("path")))
         elif action == "back":
@@ -1230,7 +2481,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | list_tabs | screenshot | back | forward | reload | switch | list_browsers | close | close_all | open_whatsapp_web | open_telegram_web | whatsapp_send | telegram_send | whatsapp_read | telegram_read (NOTE: To open the WhatsApp app on the computer, use open_app('WhatsApp') - do NOT use browser_control)"
             },
             "browser": {
                 "type": "STRING",
@@ -1239,6 +2490,18 @@ TOOL = {
             "url": {
                 "type": "STRING",
                 "description": "URL for go_to / new_tab action"
+            },
+            "receiver": {
+                "type": "STRING",
+                "description": "Recipient name/contact for whatsapp_send, telegram_send, or message reading"
+            },
+            "message": {
+                "type": "STRING",
+                "description": "Message text to send for whatsapp_send or telegram_send"
+            },
+            "limit": {
+                "type": "INTEGER",
+                "description": "Max number of messages to read for whatsapp_read or telegram_read (default: 5)"
             },
             "query": {
                 "type": "STRING",
@@ -1283,6 +2546,14 @@ TOOL = {
             "clear_first": {
                 "type": "BOOLEAN",
                 "description": "Clear field before typing (default: true)"
+            },
+            "title": {
+                "type": "STRING",
+                "description": "Page or tab title filter for close_tab action"
+            },
+            "force": {
+                "type": "BOOLEAN",
+                "description": "Forcefully terminate uncooperative or frozen tabs via OS process termination (default: false)"
             }
         },
         "required": [

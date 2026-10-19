@@ -258,6 +258,11 @@ def unwrap(text: str) -> str:
                              .replace("<<<UNTRUSTED-ESCAPED", "<<<UNTRUSTED")
 
 
+def is_done(result: str) -> bool:
+    """Did this tool action complete and verify successfully?"""
+    return str(result or "").startswith(f"status={DONE} ")
+
+
 def is_problem(result: str) -> bool:
     """Does this tool result need the user's attention?
 
