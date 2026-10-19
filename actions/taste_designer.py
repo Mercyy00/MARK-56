@@ -1249,6 +1249,46 @@ def design_creator(
         )
 
     elif asset_type in ("website", "web", "html", "site", "landing"):
+        skill_name = params.get("skill") or params.get("aesthetic")
+        p_lower = prompt.lower()
+        use_governed = bool(
+            skill_name
+            or "taste" in p_lower
+            or "vanguard" in p_lower
+            or "brutalist" in p_lower
+            or "minimalist" in p_lower
+            or "autonomous" in p_lower
+            or "bento" in p_lower
+        )
+
+        if use_governed:
+            from core.autonomous_site_generator import AutonomousSiteGenerator
+            brand = title or "VANGUARD"
+            resolved_skill = skill_name or (
+                "industrial-swiss-print" if "brutalist" in p_lower else (
+                    "utilitarian-minimalist" if "minimalist" in p_lower else "vanguard-ethereal"
+                )
+            )
+            path, bp, audit = AutonomousSiteGenerator.generate(
+                prompt=prompt,
+                brand_name=brand,
+                skill_identifier=resolved_skill,
+                output_filename=filename if (filename and filename.endswith(".html")) else None,
+            )
+            try:
+                open_url(f"file:///{path.resolve()}")
+            except Exception:
+                pass
+
+            audit_status = "PASSED (Zero template recycling, 100% token binding)" if audit.get("passed") else f"Audited with notes: {audit.get('violations')}"
+            return (
+                f"Generated bespoke design-governed frontend ({bp.taste_skill.name}): '{path.name}'.\n"
+                f"Typography: {bp.taste_skill.typography.display_font}\n"
+                f"Audit Status: {audit_status}\n"
+                f"File: {path}\n"
+                f"Opened in your browser."
+            )
+
         path, url = create_taste_website(
             prompt=prompt,
             title=title,
@@ -1339,6 +1379,10 @@ TOOL = {
             "filename": {
                 "type": "STRING",
                 "description": "Optional custom filename or folder name to save as."
+            },
+            "skill": {
+                "type": "STRING",
+                "description": "Taste skill archetype ('vanguard-ethereal', 'industrial-swiss-print', 'utilitarian-minimalist', or path to a SKILL.md/json) governing layout, typography, and palette."
             },
             "pages": {
                 "type": "INTEGER",
