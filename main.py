@@ -993,12 +993,9 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
-        # Explicit presentation command automatically wakes JARVIS
-        t_lower = text.lower().strip()
-        if any(kw in t_lower for kw in ("presentation time", "presentation mode", "start presentation")):
-            self.wake("presentation command")
-
-        # Respect wake-word sleep for ordinary queries:
+        # Respect wake-word sleep: a typed command must not be answered while
+        # asleep either (the sleep gate is not just for the mic). Wake first with
+        # "Hey Jarvis" or the WAKE NOW button.
         if self._wake_enabled and not self._awake:
             from memory.config_manager import get_wake_words
             sample = ", ".join(f"'{w}'" for w in get_wake_words()[:2])
