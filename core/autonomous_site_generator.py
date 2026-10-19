@@ -31,7 +31,7 @@ class AutonomousSiteGenerator:
     def generate(
         cls,
         prompt: str,
-        brand_name: str,
+        brand_name: str = "",
         skill_identifier: Union[str, Path, TasteSkillDefinition] = "vanguard-ethereal",
         output_filename: Optional[str] = None,
         custom_seed: Optional[str] = None,
@@ -80,7 +80,8 @@ class AutonomousSiteGenerator:
         audit = AttributeBinder.audit_generated_code(html_code, skill)
 
         # 5. Persist to Output Directory
-        clean_name = "".join(c if c.isalnum() else "_" for c in brand_name).lower().strip("_")
+        effective_brand = brand_name or blueprint.brand_name or "bespoke_site"
+        clean_name = "".join(c if c.isalnum() else "_" for c in effective_brand).lower().strip("_")
         fname = output_filename or f"{clean_name}_{skill.id}.html"
         target_path = OUTPUT_DIR / fname
         target_path.write_text(html_code, encoding="utf-8")
